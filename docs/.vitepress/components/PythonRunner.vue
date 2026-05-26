@@ -310,10 +310,15 @@ function _scheduleRun(code, callbacks) {
       _listeners.set(runId, {
         _done: done,
         _waitingForInput: false,
+        _interruptTimer: null,
         stdout: callbacks.stdout,
         stderr: callbacks.stderr,
         onInput: callbacks.onInput,
         finish(ok, val, err, interrupted) {
+          if (this._interruptTimer) {
+            clearTimeout(this._interruptTimer)
+            this._interruptTimer = null
+          }
           callbacks.finish?.(ok, val, err, !!interrupted)
           _listeners.delete(runId)
           done()
@@ -361,6 +366,10 @@ function _hardReset(cancelledRunId = null) {
   }
 
   for (const [id, cb] of _listeners.entries()) {
+    if (cb._interruptTimer) {
+      clearTimeout(cb._interruptTimer)
+      cb._interruptTimer = null
+    }
     if (id === cancelledRunId) {
       cb._done()
     } else {
@@ -386,17 +395,43 @@ function _hardReset(cancelledRunId = null) {
  * 软中断 (SAB 模式):写入 SIGINT (2) 到 interruptBuffer,Pyodide 会在下次
  * 检查时抛出 KeyboardInterrupt —— Python 解释器和全局状态都保留。
  *
- * 如果当前 runId 正在等 input(),需要先解锁 Atomics.wait,SIGINT 才能传递过去。
+ * 三个坑要规避:
+ *  1. 若 worker 正阻塞在 Atomics.wait (input()),JS 线程整个冻住,
+ *     根本没机会执行 Python 字节码 → 必须先解锁 wait。
+ *  2. `_waitingForInput` 标志依赖 worker postMessage 抵达,可能有时序窗口
+ *     让标志没设上但 worker 实际已在 wait 里。→ 无条件 notify 才稳。
+ *  3. 若 Python 卡在 await (例如 asyncio.sleep),runPythonAsync 的 promise
+ *     永远不 resolve (pyodide#2141)。→ 设超时,到时间还没收到 error 就 hardReset。
  */
 function _softInterrupt(runId) {
   if (!_SAB_SUPPORTED || !_interruptBuffer) return false
   const cb = _listeners.get(runId)
+  if (!cb) return false
 
-  _interruptBuffer[0] = 2  // SIGINT
-  // 若正在等待输入,推一个空字符串进去解锁 worker 的 Atomics.wait
-  if (cb && cb._waitingForInput) {
-    _sendInput(runId, '')
+  // 1. 先打 SIGINT
+  _interruptBuffer[0] = 2
+
+  // 2. 无条件唤醒可能阻塞在 Atomics.wait 上的 worker
+  //    即使没在等 input() 也无害 —— waitFlag 平时本来就是 0,notify 一个没人等的位置是 no-op
+  if (_waitFlag) {
+    // 如果真的在等 input(),给个空字符串
+    if (_inputData) Atomics.store(_inputData, 0, 0)
+    Atomics.store(_waitFlag, 0, 1)
+    Atomics.notify(_waitFlag, 0)
+    Atomics.store(_waitFlag, 0, 0)
   }
+  cb._waitingForInput = false
+
+  // 3. 1.5 秒兜底:若 Pyodide 卡在 await 里 promise 不 resolve,直接 hardReset
+  if (cb._interruptTimer) clearTimeout(cb._interruptTimer)
+  cb._interruptTimer = setTimeout(() => {
+    // 还在监听者表里 → 说明 worker 没回 error,interrupt 没生效
+    if (_listeners.has(runId)) {
+      _cancelled.add(runId)
+      _hardReset(runId)
+    }
+  }, 1500)
+
   return true
 }
 
@@ -649,8 +684,21 @@ const handleCancel = () => {
   if (sabSupported.value) {
     // 软中断:SIGINT,Python 全局状态保留,几乎瞬时
     appendOutput('\n⛔ 正在中断当前任务...\n', 'error')
-    cancel(currentRunId)
-    // finish 回调会自动把 status 切回 ready
+    const runIdToCancel = currentRunId
+    cancel(runIdToCancel)
+
+    // 兜底:如果 2 秒后 currentRunId 还没被 finish 清掉,说明走了 timeout fallback
+    // (Python 卡在 await,Pyodide promise 永不 resolve),hardReset 已被触发,
+    // 但 finish 不会被调用 —— 我们主动把 UI 复位,让 watch(isReady) 接管状态切换。
+    setTimeout(() => {
+      if (currentRunId === runIdToCancel) {
+        currentRunId = null
+        waitingForInput.value = false
+        const elapsed = ((performance.now() - runStartTime) / 1000).toFixed(3)
+        appendOutput(`[强制中断 用时 ${elapsed}s]\n\n`, 'meta')
+        // status 由 watch(isReady) 在 hardReset → re-init 过程中接管
+      }
+    }, 2000)
   } else {
     // 回退:terminate worker → 重启 (会丢失 Python 全局状态)
     const runIdToCancel = currentRunId
