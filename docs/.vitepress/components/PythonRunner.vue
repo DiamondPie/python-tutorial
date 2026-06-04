@@ -2,18 +2,18 @@
   <div class="python-runner">
     <div class="toolbar">
       <div class="actions">
-        <button
-          class="btn primary"
-          @click="handleRun"
+        <button 
+          class="btn primary" 
+          @click="handleRun" 
           :disabled="status === 'running' || status === 'initializing'"
         >
           <span class="icon" v-if="status !== 'running'">▶</span>
           <span class="icon spinner" v-else>↻</span>
           {{ status === 'running' ? '运行中...' : '运行' }}
         </button>
-        <button
-          class="btn danger"
-          @click="handleCancel"
+        <button 
+          class="btn danger" 
+          @click="handleCancel" 
           :disabled="status !== 'running'"
         >
           <span class="icon">■</span> 中断
@@ -28,24 +28,29 @@
 
     <div class="workspace">
       <div class="editor-pane" ref="editorContainer"></div>
-
       <div class="output-pane">
         <div class="output-header">输出控制台</div>
-        <div class="output-content" ref="outputEl" @click="focusInputIfWaiting">
+        <div
+          class="output-content"
+          ref="outputEl"
+          @click="focusInlineInput"
+        >
           <span
             v-for="line in outputLines"
             :key="line.id"
             :class="['log-line', line.type]"
-          >{{ line.text }}</span><input
-            v-if="waitingForInput"
-            ref="inputEl"
-            v-model="inputText"
-            class="inline-input"
+          >{{ line.text }}</span><!--
+            Inline terminal-style input: appears at end of console only while THIS
+            component is waiting for input. Uses an actual <input> so caret/edit
+            keys behave naturally; styled to be invisible-bordered + monospace so
+            it visually merges with the preceding stdout text (like a real TTY).
+          --><input
+            v-if="isWaitingInput"
+            ref="inlineInputEl"
+            v-model="userInputText"
             type="text"
-            spellcheck="false"
-            autocomplete="off"
-            autocapitalize="off"
-            :aria-label="'Standard input'"
+            class="inline-stdin"
+            aria-label="Python input prompt — press Enter to submit"
             @keydown.enter.prevent="submitInput"
           />
         </div>
@@ -57,29 +62,6 @@
 <script>
 import { ref, readonly } from 'vue'
 
-// ============ 能力检测:SharedArrayBuffer 是否可用 ============
-// 需要满足:
-//   1. SharedArrayBuffer 存在 (即 COOP/COEP 安全头已设置或环境支持)
-//   2. Atomics 可用
-//   3. 实际能够 new SharedArrayBuffer (有些环境定义了但不允许实例化)
-const _SAB_SUPPORTED = (() => {
-  try {
-    if (typeof SharedArrayBuffer === 'undefined') return false
-    if (typeof Atomics === 'undefined') return false
-    // crossOriginIsolated 在 Service Worker 之外通常表示安全头是否到位
-    if (typeof self !== 'undefined' && 'crossOriginIsolated' in self
-        && self.crossOriginIsolated === false) {
-      return false
-    }
-    // 试着真正分配一次 —— 某些环境定义了构造器但禁止使用
-    // eslint-disable-next-line no-new
-    new SharedArrayBuffer(4)
-    return true
-  } catch {
-    return false
-  }
-})()
-
 // ============ 模块级单例:整页共享 ============
 let _worker      = null
 let _initPromise = null
@@ -88,122 +70,183 @@ let _initReject  = null
 let _runIdCtr    = 0
 let _runQueue    = Promise.resolve()
 
-// SAB 模式下用于 stdin / interrupt 的共享缓冲
-const _INPUT_BUF_SIZE = 4096
-let _inputBuffer     = null   // SharedArrayBuffer (raw)
-let _inputData       = null   // Uint8Array view
-let _waitBuffer      = null   // SharedArrayBuffer (raw)
-let _waitFlag        = null   // Int32Array view
-let _interruptBuffer = null   // Uint8Array view (SharedArrayBuffer-backed)
-const _encoder       = new TextEncoder()
-
 const _pyVersion = ref(null)
 const _isReady   = ref(false)
-const _sabSupported = ref(_SAB_SUPPORTED)
 
 // 监听者 & 取消集合
-const _listeners = new Map()     // runId -> { stdout, stderr, finish, onInput, _done, _waitingForInput }
+const _listeners = new Map()     // runId -> { stdout, stderr, finish, _done }
 const _cancelled = new Set()     // 被软取消的 runId
 
-// ============ Worker 源码 (内联) ============
-// 与上传的 pyodide-worker.js 思路一致:支持 SAB 下的同步 stdin + interruptBuffer
-// 不依赖 SAB 时,stdin 直接返回空字符串 (调用方应避免在 input() 程序上点中断)
 const WORKER_SRC = `
 importScripts('https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js')
 let pyodide = null
-let inputData = null
-let waitFlag = null
-const decoder = new TextDecoder()
+self.baseUrl = ''
+// runId 当前正在执行的任务 id —— 在 stdin() 时回传给主线程,用于路由输入到正确的组件
+let _currentRunId = 0
 
-self.onmessage = async (e) => {
-  const { type } = e.data
+// ─── 自管 stdout / stderr 缓冲 ───────────────────────────────────────────
+// 不能用 pyodide 内置的 batched 模式: batched 只在遇到 \\n 时才 flush,
+// 而 input(prompt) 写的 prompt 不带换行,会被压在缓冲区里出不来 —— 表现
+// 就是"输入框出现时看不到提示文字,等用户回车后 prompt 才迟到地冒出来"。
+//
+// 解决: 改用 raw (逐字节) 模式自己攒 buffer,遇到换行时 flush;同时在
+// stdin() 阻塞前主动 flush 一次,确保 prompt 先抵达 UI,再让用户输入。
+//
+// 关键: raw 回调每次给一个**字节**(整数 0-255),不是字符。中文等多字节
+// UTF-8 字符必须把字节攒齐再用 TextDecoder 解码,否则会出现 'æ¬¢è¿' 这种
+// 把 UTF-8 字节当 Latin-1 单字符错解的乱码。
+// 用 stream:true 的 decoder 还能正确处理"flush 时正好停在多字节字符中间"
+// 的情况 —— 半个字符会被暂存到下一次 flush 自动拼回去。
+const _outBytes = [];
+const _errBytes = [];
+const _outDecoder = new TextDecoder('utf-8');
+const _errDecoder = new TextDecoder('utf-8');
 
-  if (type === 'init') {
-    try {
-      pyodide = await loadPyodide({
-        indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.2/full/',
-        checkAPIVersion: false
-      })
-      self.postMessage({ type: 'ready', version: pyodide.version })
-    } catch (err) {
-      self.postMessage({ type: 'error', id: 0, message: String(err) })
+function _flushOut() {
+  if (_outBytes.length === 0) return;
+  const text = _outDecoder.decode(new Uint8Array(_outBytes), { stream: true });
+  _outBytes.length = 0;
+  if (text) self.postMessage({ type: 'stdout', id: _currentRunId, text });
+}
+function _flushErr() {
+  if (_errBytes.length === 0) return;
+  const text = _errDecoder.decode(new Uint8Array(_errBytes), { stream: true });
+  _errBytes.length = 0;
+  if (text) self.postMessage({ type: 'stderr', id: _currentRunId, text });
+}
+function _flushAll() { _flushOut(); _flushErr(); }
+
+// ─── Python 错误信息精简 ──────────────────────────────────────────────
+// Pyodide 抛出的 PythonError 的 .message 是完整 traceback,大致长这样:
+//   PythonError: Traceback (most recent call last):
+//     File "/lib/python312.zip/_pyodide/_base.py", line 596, in eval_code_async
+//       await CodeRunner(
+//     File "/lib/python312.zip/_pyodide/_base.py", line 410, in run_async
+//       coroutine = eval(self.code, globals, locals)
+//                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//     File "<exec>", line 7, in <module>
+//     File "<exec>", line 5, in main
+//   ZeroDivisionError: division by zero
+//
+// 用户只关心:
+//   1) 'Traceback (most recent call last):' 标题
+//   2) 自己代码里的帧 (File "<exec>" / "<stdin>") + 它们的上下文行
+//   3) 最后一行的异常类型 + 描述
+// Pyodide runtime 自己的帧 (/lib/python*/.../, /lib/pyodide/) 是噪音,过滤掉。
+//
+// 注意: Python 3.11+ 的 traceback 在源码行下面还会多一行 ^^^ 标记,所以一个
+// 帧之后跟着的"上下文行"可能不止一行 —— 凡是缩进开头的连续行都算上下文。
+function _formatPyError(raw) {
+  if (!raw) return raw;
+  let s = String(raw);
+  // 去掉首行 'PythonError: ' 前缀(Pyodide JS 端包装)
+  s = s.replace(/^PythonError:\\s*/, '');
+
+  const lines = s.split('\\n');
+  const kept = [];
+  let inTraceback = false;
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (/^Traceback \\(most recent call last\\):/.test(ln)) {
+      kept.push(ln);
+      inTraceback = true;
+      continue;
     }
-    return
+    if (inTraceback && /^\\s*File \\"/.test(ln)) {
+      // 一个 traceback 帧 + 紧随其后所有"上下文行"。
+      // 上下文行的定义: 缩进起首,且本身不是另一个 File 帧。
+      // (traceback 里 File 行也是缩进的,所以单纯按缩进会把下一个帧错当上下文吃掉)
+      const isContext = (s2) => /^\\s+/.test(s2) && !/^\\s*File \\"/.test(s2);
+
+      const isInternal = /File \\"\\/lib\\/python|File \\"\\/lib\\/pyodide|_pyodide[\\\\/]_base/.test(ln);
+      if (isInternal) {
+        // 跳过 File 行本身 + 后续所有连续的上下文行
+        while (i + 1 < lines.length && isContext(lines[i + 1])) i++;
+        continue;
+      }
+      kept.push(ln);
+      while (i + 1 < lines.length && isContext(lines[i + 1])) {
+        kept.push(lines[i + 1]);
+        i++;
+      }
+      continue;
+    }
+    // 非 File 行: traceback 末尾的异常描述 (如 'ValueError: ...') 或其他内容
+    kept.push(ln);
   }
 
-  if (type === 'setup-sab') {
-    // 仅在主线程检测到 SAB 时才会发来
-    inputData = new Uint8Array(e.data.inputBuffer)
-    waitFlag  = new Int32Array(e.data.waitBuffer)
-    if (e.data.interruptBuffer) {
-      pyodide.setInterruptBuffer(new Uint8Array(e.data.interruptBuffer))
+  // 极端情况兜底: 过滤后所有用户帧都不在,只剩 'Traceback:' 标题 + 异常描述
+  // —— 把标题也丢掉,只留最后那行异常描述,免得显示一个空 traceback
+  const hasUserFrame = kept.some(l => /^\\s*File \\"/.test(l));
+  if (!hasUserFrame) {
+    const lastNonEmpty = [...kept].reverse().find(l => l.trim().length > 0);
+    return (lastNonEmpty || s).trim();
+  }
+
+  return kept.join('\\n').trim();
+}
+
+self.onmessage = async ({ data: { type, code, id, baseUrl } }) => {
+  if (type === 'init') {
+    if (baseUrl) self.baseUrl = baseUrl;
+    try {
+      pyodide = await loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.2/full/' })
+
+      // ─── 标准输出 / 错误: 逐字节进 buffer,遇 \\n (0x0A) flush ───
+      // 注意: raw 回调每次给一个字节(整数 0-255),不是 unicode char。
+      // 这里只 push 字节,真正的 UTF-8 解码在 _flushOut/_flushErr 里做。
+      pyodide.setStdout({
+        raw: (byte) => {
+          _outBytes.push(byte);
+          if (byte === 0x0A) _flushOut();
+        }
+      });
+      pyodide.setStderr({
+        raw: (byte) => {
+          _errBytes.push(byte);
+          if (byte === 0x0A) _flushErr();
+        }
+      });
+
+      // ─── 核心:劫持 Python 标准输入 ───
+      // 1) 先 flush stdout/stderr —— 把 input(prompt) 的 prompt 先发出去,
+      //    否则它会卡在 buffer 里,等用户输入完才迟到出现。
+      // 2) 发一条 input_request 给主线程,带 runId,主线程按 id 路由到正确组件。
+      // 3) 同步 XHR 把 Worker 钉死,等 SW 塞数据回来 (维持原 SW + sync XHR 架构)。
+      pyodide.setStdin({
+        stdin: () => {
+          _flushAll();
+          self.postMessage({ type: 'input_request', id: _currentRunId });
+          const targetUrl = self.baseUrl + '/__pyodide_input_trigger__?id=' + _currentRunId + '&r=' + Math.random();
+          const xhr = new XMLHttpRequest();
+          xhr.open('GET', targetUrl, false);
+          xhr.send(null);
+          return xhr.responseText;
+        }
+      });
+
+      self.postMessage({ type: 'ready', version: pyodide.version })
+    } catch (e) {
+      self.postMessage({ type: 'error', id: 0, message: String(e) })
     }
     return
   }
 
   if (type === 'run') {
-    const { id, code } = e.data
-
-    // stdout / stderr (按 chunk 分发,以便部分输出可以即时显示——例如 input() 之前的提示)
-    pyodide.setStdout({ write: (buf) => {
-      self.postMessage({ type: 'stdout', id, text: decoder.decode(buf) })
-      return buf.length
-    }})
-    pyodide.setStderr({ write: (buf) => {
-      self.postMessage({ type: 'stderr', id, text: decoder.decode(buf) })
-      return buf.length
-    }})
-
-    // stdin —— 只在 SAB 模式下真正同步等待
-    if (inputData && waitFlag) {
-      pyodide.setStdin({ stdin: () => {
-        self.postMessage({ type: 'input', id })
-        // 同步阻塞,等主线程写入数据并 notify
-        Atomics.wait(waitFlag, 0, 0)
-        const len = Atomics.load(inputData, 0)
-        const arr = new Uint8Array(len)
-        for (let i = 0; i < len; i++) arr[i] = Atomics.load(inputData, i + 1)
-        const text = decoder.decode(arr)
-        // 把用户输入回显到输出区,模拟终端行为
-        self.postMessage({ type: 'stdout', id, text: text + '\\n' })
-        return text
-      }})
-    } else {
-      pyodide.setStdin({ stdin: () => {
-        self.postMessage({ type: 'stderr', id,
-          text: '\\n[input() 不可用:当前环境缺少 SharedArrayBuffer 支持]\\n' })
-        return ''
-      }})
-    }
-
+    _currentRunId = id
+    // 新任务开始前清掉残留 buffer (理论上不会有,防御性)
+    _outBytes.length = 0; _errBytes.length = 0;
     try {
       await pyodide.loadPackagesFromImports(code)
-      // 每次运行用全新的 globals,避免互相污染
-      const dict = pyodide.globals.get('dict')
-      const globals = dict()
-      try {
-        const result = await pyodide.runPythonAsync(code, {
-          filename: '<editor>',
-          globals,
-          locals: globals
-        })
-        self.postMessage({
-          type: 'result', id,
-          value: result == null ? null : String(result)
-        })
-      } finally {
-        globals.destroy()
-        dict.destroy()
-      }
-    } catch (err) {
-      // KeyboardInterrupt 是用户主动中断,不需要把整段 traceback 推上去
-      const msg = String(err && err.message ? err.message : err)
-      const isInterrupt = msg.includes('KeyboardInterrupt')
-      self.postMessage({
-        type: 'error', id,
-        message: msg,
-        interrupted: isInterrupt
-      })
+      const result = await pyodide.runPythonAsync(code)
+      _flushAll();  // 运行结束兜底 flush 一次,避免末尾不带换行的输出丢失
+      self.postMessage({ type: 'result', id, value: result == null ? null : String(result) })
+    } catch (e) {
+      _flushAll();  // 抛错前也兜底 flush
+      // 用 e.message 而非 String(e) —— Pyodide 的 PythonError 的 message
+      // 才是干净的 traceback 文本;再经 _formatPyError 去掉 Pyodide 内部帧。
+      const raw = (e && e.message) ? e.message : String(e);
+      self.postMessage({ type: 'error', id, message: _formatPyError(raw) })
     }
   }
 }
@@ -216,17 +259,7 @@ function _createWorker() {
   w.onmessage = ({ data: msg }) => {
     if (msg.type === 'ready') {
       _pyVersion.value = msg.version
-      // 在 ready 之后才能 setInterruptBuffer —— pyodide 实例此时才存在
-      if (_SAB_SUPPORTED) {
-        _ensureSabAllocated()
-        w.postMessage({
-          type: 'setup-sab',
-          inputBuffer: _inputBuffer,
-          waitBuffer: _waitBuffer,
-          interruptBuffer: _interruptBuffer.buffer
-        })
-      }
-      _isReady.value = true
+      _isReady.value   = true
       _initResolve?.()
       _initResolve = _initReject = null
       return
@@ -251,7 +284,7 @@ function _createWorker() {
       }
 
       if (msg.type === 'result') cb.finish(true, msg.value, null)
-      else cb.finish(false, null, msg.message, !!msg.interrupted)
+      else cb.finish(false, null, msg.message)
       return
     }
 
@@ -260,27 +293,10 @@ function _createWorker() {
     if (!cb) return
     if (msg.type === 'stdout') cb.stdout?.(msg.text)
     if (msg.type === 'stderr') cb.stderr?.(msg.text)
-    if (msg.type === 'input') {
-      cb._waitingForInput = true
-      cb.onInput?.()
-    }
+    // 路由 stdin 请求:只通知该 runId 对应的组件 —— 修复多组件同时弹输入的 bug
+    if (msg.type === 'input_request') cb.onInputRequest?.()
   }
   return w
-}
-
-function _ensureSabAllocated() {
-  if (!_SAB_SUPPORTED) return
-  if (!_inputBuffer) {
-    _inputBuffer = new SharedArrayBuffer(_INPUT_BUF_SIZE)
-    _inputData   = new Uint8Array(_inputBuffer)
-  }
-  if (!_waitBuffer) {
-    _waitBuffer  = new SharedArrayBuffer(4)
-    _waitFlag    = new Int32Array(_waitBuffer)
-  }
-  if (!_interruptBuffer) {
-    _interruptBuffer = new Uint8Array(new SharedArrayBuffer(1))
-  }
 }
 
 function _getWorker() {
@@ -294,7 +310,11 @@ function _ensureInit() {
   _initPromise = new Promise((resolve, reject) => {
     _initResolve = resolve
     _initReject  = reject
-    _getWorker().postMessage({ type: 'init' })
+    const currentOrigin = typeof window !== 'undefined' ? window.location.origin : ''
+    _getWorker().postMessage({ 
+      type: 'init', 
+      baseUrl: currentOrigin
+    })
   })
   return _initPromise
 }
@@ -302,6 +322,7 @@ function _ensureInit() {
 function _scheduleRun(code, callbacks) {
   const runId = ++_runIdCtr
   _runQueue = _runQueue.then(() => {
+    // 队列前面被 hardReset 中止时,本次任务可能已被标记取消
     if (_cancelled.has(runId)) {
       _cancelled.delete(runId)
       return
@@ -309,23 +330,15 @@ function _scheduleRun(code, callbacks) {
     return new Promise(done => {
       _listeners.set(runId, {
         _done: done,
-        _waitingForInput: false,
-        _interruptTimer: null,
         stdout: callbacks.stdout,
         stderr: callbacks.stderr,
-        onInput: callbacks.onInput,
-        finish(ok, val, err, interrupted) {
-          if (this._interruptTimer) {
-            clearTimeout(this._interruptTimer)
-            this._interruptTimer = null
-          }
-          callbacks.finish?.(ok, val, err, !!interrupted)
+        onInputRequest: callbacks.onInputRequest,
+        finish(ok, val, err) {
+          callbacks.finish?.(ok, val, err)
           _listeners.delete(runId)
           done()
         },
       })
-      // 清零中断标志,以免上一次 SIGINT 残留
-      if (_SAB_SUPPORTED && _interruptBuffer) _interruptBuffer[0] = 0
       _getWorker().postMessage({ type: 'run', code, id: runId })
     })
   })
@@ -333,172 +346,90 @@ function _scheduleRun(code, callbacks) {
 }
 
 /**
- * 向运行中的 Python 进程提交一行 stdin。
- * 仅在 SAB 模式下有效。
- */
-function _sendInput(runId, text) {
-  if (!_SAB_SUPPORTED) return false
-  const cb = _listeners.get(runId)
-  if (!cb || !cb._waitingForInput) return false
-
-  const bytes = _encoder.encode(text ?? '')
-  // 截断到缓冲区容量内 (保留 1 字节给长度)
-  const maxLen = Math.min(bytes.length, _INPUT_BUF_SIZE - 1)
-  Atomics.store(_inputData, 0, maxLen)
-  for (let i = 0; i < maxLen; i++) Atomics.store(_inputData, i + 1, bytes[i])
-
-  cb._waitingForInput = false
-
-  Atomics.store(_waitFlag, 0, 1)
-  Atomics.notify(_waitFlag, 0)
-  Atomics.store(_waitFlag, 0, 0)
-  return true
-}
-
-/**
  * 硬重启:terminate 当前 Worker,清理所有状态,自动重新 init。
- * 在无 SAB 环境 (或 SAB 也无法 SIGINT 的极端情况) 下使用。
+ * - 所有正在执行 / 排队等待的任务都会被通知失败
+ * - isReady 会先变 false,init 完成后再变 true
+ * - 入参 cancelledRunId 表示是哪个 runId 触发的重启(那个任务不发 abort 错误,因为调用方已经知道)
  */
 function _hardReset(cancelledRunId = null) {
+  // 1. 杀掉当前 Worker
   if (_worker) {
     _worker.terminate()
     _worker = null
   }
 
+  // 2. 通知所有挂起的监听者:任务被中断了
   for (const [id, cb] of _listeners.entries()) {
-    if (cb._interruptTimer) {
-      clearTimeout(cb._interruptTimer)
-      cb._interruptTimer = null
-    }
     if (id === cancelledRunId) {
+      // 触发中断的那一个:让 promise 链解锁,但不调用 finish (UI 由 handleCancel 直接处理)
       cb._done()
     } else {
+      // 被牵连的其他任务(队列里其他组件的):给个明确的失败通知
       try {
-        cb.finish?.(false, null, '⚠ 因其他任务中断,该任务被一并取消。请重新运行。', false)
+        cb.finish?.(false, null, '⚠ 因其他任务中断,该任务被一并取消。请重新运行。')
       } catch (e) { /* ignore */ }
     }
   }
   _listeners.clear()
   _cancelled.clear()
 
+  // 3. 重置队列(丢弃所有未开始的排队任务)
   _runQueue = Promise.resolve()
 
+  // 4. 重置 ready 标志 & init promise
   _isReady.value = false
   _pyVersion.value = null
   _initPromise = null
   _initResolve = _initReject = null
 
-  _ensureInit().catch(() => { /* 错误已通过 reject 传出 */ })
-}
-
-/**
- * 软中断 (SAB 模式):写入 SIGINT (2) 到 interruptBuffer,Pyodide 会在下次
- * 检查时抛出 KeyboardInterrupt —— Python 解释器和全局状态都保留。
- *
- * 三个坑要规避:
- *  1. 若 worker 正阻塞在 Atomics.wait (input()),JS 线程整个冻住,
- *     根本没机会执行 Python 字节码 → 必须先解锁 wait。
- *  2. `_waitingForInput` 标志依赖 worker postMessage 抵达,可能有时序窗口
- *     让标志没设上但 worker 实际已在 wait 里。→ 无条件 notify 才稳。
- *  3. 若 Python 卡在 await (例如 asyncio.sleep),runPythonAsync 的 promise
- *     永远不 resolve (pyodide#2141)。→ 设超时,到时间还没收到 error 就 hardReset。
- */
-function _softInterrupt(runId) {
-  if (!_SAB_SUPPORTED || !_interruptBuffer) return false
-  const cb = _listeners.get(runId)
-  if (!cb) return false
-
-  // 1. 先打 SIGINT
-  _interruptBuffer[0] = 2
-
-  // 2. 无条件唤醒可能阻塞在 Atomics.wait 上的 worker
-  //    即使没在等 input() 也无害 —— waitFlag 平时本来就是 0,notify 一个没人等的位置是 no-op
-  if (_waitFlag) {
-    // 如果真的在等 input(),给个空字符串
-    if (_inputData) Atomics.store(_inputData, 0, 0)
-    Atomics.store(_waitFlag, 0, 1)
-    Atomics.notify(_waitFlag, 0)
-    Atomics.store(_waitFlag, 0, 0)
-  }
-  cb._waitingForInput = false
-
-  // 3. 1.5 秒兜底:若 Pyodide 卡在 await 里 promise 不 resolve,直接 hardReset
-  if (cb._interruptTimer) clearTimeout(cb._interruptTimer)
-  cb._interruptTimer = setTimeout(() => {
-    // 还在监听者表里 → 说明 worker 没回 error,interrupt 没生效
-    if (_listeners.has(runId)) {
-      _cancelled.add(runId)
-      _hardReset(runId)
-    }
-  }, 1500)
-
-  return true
+  // 5. 立即开始新一轮 init (UI 那边的 isReady watch 会自动反应)
+  _ensureInit().catch(() => { /* 错误已经通过 reject 传出 */ })
 }
 
 export function usePyodide() {
   return {
     pyVersion: readonly(_pyVersion),
     isReady: readonly(_isReady),
-    sabSupported: readonly(_sabSupported),
     ensureInit: _ensureInit,
     run: async (code, callbacks) => {
       await _ensureInit()
       return _scheduleRun(code, callbacks)
     },
-    sendInput: _sendInput,
-    /**
-     * 取消运行中的任务:
-     *  - SAB 模式 → 软中断 (SIGINT),保留 Python 全局状态,几乎瞬时
-     *  - 否则 → 硬重启 Worker (现有兜底逻辑)
-     */
+    /** 软取消:terminate 当前 Worker 并重启 (语义上"立刻停下",代价是丢失 Python 全局状态) */
     cancel: (runId) => {
       if (runId == null) return
-      if (_SAB_SUPPORTED) {
-        _softInterrupt(runId)
-      } else {
-        _cancelled.add(runId)
-        _hardReset(runId)
-      }
+      _cancelled.add(runId)
+      _hardReset(runId)
     }
   }
 }
 </script>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
-import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, highlightSpecialChars } from '@codemirror/view'
+import { ref, onMounted, onBeforeUnmount, nextTick, watch, useSlots } from 'vue'
+import { basicSetup } from 'codemirror'
+import { EditorView, keymap } from '@codemirror/view'
 import { EditorState, Compartment } from '@codemirror/state'
-import {
-  history, defaultKeymap, historyKeymap, indentWithTab
-} from '@codemirror/commands'
-import {
-  syntaxHighlighting, defaultHighlightStyle, bracketMatching,
-  indentOnInput, indentUnit, foldGutter, foldKeymap
-} from '@codemirror/language'
-import { searchKeymap, highlightSelectionMatches } from '@codemirror/search'
-import { closeBrackets, closeBracketsKeymap, autocompletion, completionKeymap } from '@codemirror/autocomplete'
-import { lintKeymap } from '@codemirror/lint'
-import { python, pythonLanguage } from '@codemirror/lang-python'
+import { indentWithTab, redo } from '@codemirror/commands'
+import { indentUnit } from '@codemirror/language'
+import { completionStatus, acceptCompletion } from '@codemirror/autocomplete'
+import { python } from '@codemirror/lang-python'
 import { githubLight, githubDark } from '@uiw/codemirror-theme-github'
-import { pythonBuiltin } from './pythonBuiltin'
 
-const props = defineProps({
-  initialCode: {
-    type: String,
-    default: 'print("Hello, Shared Worker!")'
-  }
-})
+// const props = defineProps({
+//   initialCode: {
+//     type: String,
+//     default: 'print("Hello, Shared Worker!")'
+//   }
+// })
+const slots = useSlots()
 
 // === UI 状态 ===
-const status = ref('idle')        // 'idle' | 'initializing' | 'ready' | 'running'
+// 'idle' | 'initializing' | 'ready' | 'running'
+const status = ref('idle')
 const statusText = ref('等待运行')
 const outputLines = ref([])
 const outputEl = ref(null)
-
-// 内联输入状态
-const waitingForInput = ref(false)
-const inputText = ref('')
-const inputEl = ref(null)
 
 // === CodeMirror 6 状态 ===
 const editorContainer = ref(null)
@@ -507,23 +438,71 @@ const themeCompartment = new Compartment()
 let themeObserver = null
 
 // === Pyodide 钩子 ===
-const { pyVersion, isReady, sabSupported, ensureInit, run, cancel, sendInput } = usePyodide()
+const { pyVersion, isReady, ensureInit, run, cancel } = usePyodide()
 let currentRunId = null
 let runStartTime = 0
 
-const checkDarkMode = () => typeof document !== 'undefined'
-  && document.documentElement.classList.contains('dark')
+const isWaitingInput = ref(false)
+const userInputText = ref('')
+const inlineInputEl = ref(null)
 
-const setReadyUI = () => {
-  status.value = 'ready'
-  statusText.value = `Python ${pyVersion.value} 就绪`
-    + (sabSupported.value ? '' : ' (input/即时中断不可用)')
+const checkDarkMode = () => typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
+
+const getCodeFromSlots = () => {
+  if (!slots.default) return props.initialCode.trim()
+  
+  // 遍历插槽节点，将所有文本节点拼接起来
+  const children = slots.default()
+  let code = ''
+  for (const node of children) {
+    if (typeof node.children === 'string') {
+      code += node.children
+    } else if (Array.isArray(node.children)) {
+      // 应对一些边界情况
+      code += node.children.map(c => (typeof c === 'string' ? c : '')).join('')
+    }
+  }
+  return code.trim()
 }
 
+// 让用户点击控制台空白处时,焦点回到正在等待的输入框 (真实终端体验)
+const focusInlineInput = () => {
+  if (isWaitingInput.value) inlineInputEl.value?.focus()
+}
+
+// 提交用户输入 —— 通过 Service Worker 把数据塞回挂起的同步 XHR
+const submitInput = () => {
+  if (!isWaitingInput.value) return
+
+  const value = userInputText.value
+  if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+    navigator.serviceWorker.controller.postMessage({
+      type: 'INPUT_SUBMIT',
+      value: value + '\n' // Python 的 input() 期望以换行符结束
+    })
+  }
+
+  // 在控制台里把用户刚输入的内容当作 stdout 留痕,模拟真实终端的回显
+  appendOutput(value + '\n', 'stdout')
+
+  // 重置状态
+  userInputText.value = ''
+  isWaitingInput.value = false
+}
+
+// 把 UI 切回"空闲就绪"状态
+const setReadyUI = () => {
+  status.value = 'ready'
+  statusText.value = `Pyodide ${pyVersion.value} 就绪`
+}
+
+// 监听全局 ready 状态变化,自动同步 UI
+// 运行中(running)时不动它的状态,避免覆盖
 watch(isReady, (ready) => {
   if (ready) {
     if (status.value !== 'running') setReadyUI()
   } else {
+    // isReady 变 false 通常意味着 Worker 正在重启(被其他组件取消触发)
     if (status.value !== 'running') {
       status.value = 'initializing'
       statusText.value = '环境重启中...'
@@ -532,56 +511,105 @@ watch(isReady, (ready) => {
 })
 
 onMounted(async () => {
-  // 1. CodeMirror —— 显式装配 basicSetup 的等价扩展,这样可以:
-  //    · 用 historyKeymap 提供的 Ctrl+Z / Ctrl+Shift+Z (无障碍历史)
-  //    · 用 indentWithTab 提供"Tab 缩进、Escape 后 Tab 跳焦"的无障碍 Tab 行为
-  //    · 叠加 pythonBuiltin 高亮内置函数
+  // ─── 注册 Service Worker (仍是 input() 同步 XHR 的代理) ───
+  // 注意:这里不再监听 SW 的 INPUT_REQUEST 广播 —— 那样会让"页面上所有
+  // PythonRunner 同时弹出输入框"。改成由 Worker 主动 postMessage 一条带
+  // runId 的 input_request,经 w.onmessage 路由到 _listeners 里对应组件的
+  // onInputRequest 回调(见 handleRun)。SW 端的实现可以保持原样。
+  if ('serviceWorker' in navigator) {
+    try {
+      await navigator.serviceWorker.register('/sw.js')
+      navigator.serviceWorker.ready.then(() => {
+        console.log('Pyodide Stdin Proxy Service Worker Ready')
+      })
+    } catch (err) {
+      console.error('Service Worker 注册失败,无法支持 input():', err)
+    }
+  }
+
+  const defaultCode = getCodeFromSlots();
+
+  // 1. 初始化 CodeMirror
   editorView = new EditorView({
     parent: editorContainer.value,
     state: EditorState.create({
-      doc: props.initialCode.trim(),
+      doc: defaultCode,
       extensions: [
-        lineNumbers(),
-        highlightActiveLineGutter(),
-        highlightSpecialChars(),
-        history(),                           // 启用撤销/重做历史栈
-        foldGutter(),
-        drawSelection(),
-        EditorState.allowMultipleSelections.of(true),
-        indentOnInput(),
-        syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-        bracketMatching(),
-        closeBrackets(),
-        autocompletion(),
-        highlightActiveLine(),
-        highlightSelectionMatches(),
-        keymap.of([
-          ...closeBracketsKeymap,
-          ...defaultKeymap,
-          ...searchKeymap,
-          ...historyKeymap,                  // ⌘/Ctrl+Z, ⌘/Ctrl+Shift+Z, ⌘/Ctrl+Y
-          ...foldKeymap,
-          ...completionKeymap,
-          ...lintKeymap,
-          indentWithTab                      // Tab 缩进、Shift+Tab 减少缩进;Esc 后 Tab 跳焦
-        ]),
-        indentUnit.of('    '),
+        basicSetup, // 自带 history() + historyKeymap (Ctrl+Z / Ctrl+Y 已就绪)
         python(),
-        pythonBuiltin(pythonLanguage),       // 高亮 print/len/... 等内置
-        themeCompartment.of(checkDarkMode() ? githubDark : githubLight)
-      ]
-    })
+
+        // === 无障碍 Tab 处理 + 补全优先 ===
+        // CodeMirror 6 默认让 Tab 移动焦点(键盘用户能离开编辑器),但代价
+        // 是无法用 Tab 插入缩进。常见两难。这里采用 Monaco 同款 a11y 模式:
+        //   - 当补全菜单弹出时,Tab 接受当前补全候选(优先于缩进,避免冲突)
+        //   - 否则 Tab 插入缩进
+        //   - Escape 主动让编辑器失焦,这样紧接着按 Tab 就能离开,不会被困
+        // 这也是 WCAG 2.1.2 (No Keyboard Trap) 的合规解法。
+        //
+        // 关键: 这条 keymap 在 basicSetup 内置的 completionKeymap 之前注册
+        // (extension 数组里在它后面 = 优先级更高),所以这里必须自己处理
+        // 补全场景,不能指望事件"穿透"到后面的 keymap。
+        keymap.of([
+          {
+            key: 'Tab',
+            run: (view) => {
+              // completionStatus 返回 'active' / 'pending' / null。
+              // 'active' 表示菜单已显示且有候选项 —— 这时 Tab 应接受补全。
+              if (completionStatus(view.state) === 'active') {
+                return acceptCompletion(view);
+              }
+              // 没有可接受的补全 —— 走原本的缩进逻辑
+              return indentWithTab.run(view);
+            },
+            // Shift+Tab 仍然走 indentWithTab 的反向缩进(它内部已处理 shift)
+            shift: indentWithTab.shift,
+            preventDefault: true,
+          },
+          {
+            key: 'Escape',
+            run: (view) => {
+              view.contentDOM.blur()
+              return true
+            },
+          },
+        ]),
+        indentUnit.of('    '), // Python 缩进:4 个空格
+
+        // === 撤销 / 重做 ===
+        // basicSetup 已含 historyKeymap (Ctrl+Z=undo, Ctrl+Y=redo, Mac 上
+        // Cmd+Shift+Z=redo)。下面这一行额外保证非 Mac 平台也能用
+        // Ctrl+Shift+Z 重做,跨平台一致。
+        keymap.of([
+          { key: 'Mod-Shift-z', run: redo, preventDefault: true },
+        ]),
+
+        // 修复 VitePress 的 .vp-doc li + li { margin-top: 8px } 入侵了
+        // CodeMirror 补全下拉列表里的 <li> 元素导致候选项之间出现难看的间距。
+        // EditorView.theme() 生成带随机前缀的 scoped class 并挂到编辑器根节点,
+        // 选择器优先级高于 .vp-doc 的规则,把 margin 重置为 0。
+        EditorView.theme({
+          '.cm-tooltip-autocomplete li + li': { marginTop: '0 !important' },
+        }),
+
+        // 让外层无障碍工具知道这是一个代码编辑区
+        EditorView.contentAttributes.of({
+          'aria-label': 'Python code editor. Press Escape to leave the editor.',
+        }),
+
+        themeCompartment.of(checkDarkMode() ? githubDark : githubLight),
+      ],
+    }),
   })
 
+  // 2. 监听 VitePress 深浅色切换
   themeObserver = new MutationObserver(() => {
     editorView.dispatch({
       effects: themeCompartment.reconfigure(checkDarkMode() ? githubDark : githubLight)
     })
   })
-  themeObserver.observe(document.documentElement, {
-    attributes: true, attributeFilter: ['class']
-  })
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
 
+  // 3. 预热环境 —— await 完成后立即同步 UI,不再依赖 watch 兜底
   if (isReady.value) {
     setReadyUI()
     return
@@ -602,9 +630,10 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (themeObserver) themeObserver.disconnect()
   if (editorView) editorView.destroy()
+  // 卸载组件时如果还有任务在跑,不主动 cancel —— 否则会影响其他组件
 })
 
-// === 输出辅助 ===
+// === 输出辅助函数 ===
 const appendOutput = (text, type = 'info') => {
   outputLines.value.push({ id: Date.now() + Math.random(), text, type })
   nextTick(() => {
@@ -614,21 +643,7 @@ const appendOutput = (text, type = 'info') => {
 
 const clearOutput = () => { outputLines.value = [] }
 
-const focusInputIfWaiting = () => {
-  if (waitingForInput.value && inputEl.value) inputEl.value.focus()
-}
-
-const submitInput = () => {
-  if (!waitingForInput.value || currentRunId == null) return
-  const text = inputText.value
-  inputText.value = ''
-  waitingForInput.value = false
-  // SAB 模式下 worker 会把这段文本回显到 stdout (带换行),所以这里不再 appendOutput
-  // 无 SAB 模式下根本不会显示输入框,所以也走不到这一步
-  sendInput(currentRunId, text)
-}
-
-// === 执行 ===
+// === 执行逻辑 ===
 const handleRun = async () => {
   if (status.value === 'running' || status.value === 'initializing') return
   const code = editorView.state.doc.toString().trim()
@@ -637,34 +652,34 @@ const handleRun = async () => {
   status.value = 'running'
   statusText.value = '排队执行中...'
   runStartTime = performance.now()
-  waitingForInput.value = false
-  inputText.value = ''
 
   try {
     currentRunId = await run(code, {
       stdout: (text) => appendOutput(text, 'stdout'),
       stderr: (text) => appendOutput(text, 'stderr'),
-      onInput: async () => {
-        waitingForInput.value = true
-        await nextTick()
-        inputEl.value?.focus()
+      // 只有"自己的"那次运行触发 input() 时,本组件才会进入等待输入状态。
+      // 这条回调是由 worker.onmessage 按 runId 路由进来的,从根上避免了
+      // "页面上多个 PythonRunner 同时显示输入框"的 bug。
+      onInputRequest: () => {
+        isWaitingInput.value = true
+        nextTick(() => inlineInputEl.value?.focus())
       },
-      finish: (ok, val, err, interrupted) => {
+      finish: (ok, val, err) => {
+        // 如果是被 cancel 触发的牵连任务,currentRunId 已被置 null,跳过 UI 切换
         if (currentRunId === null) return
 
-        waitingForInput.value = false
         const elapsed = ((performance.now() - runStartTime) / 1000).toFixed(3)
         if (ok) {
           if (val !== null) appendOutput(`=> ${val}\n`, 'result')
           appendOutput(`[执行完成 用时 ${elapsed}s]\n\n`, 'meta')
-        } else if (interrupted) {
-          appendOutput(`\n⛔ 已中断 (KeyboardInterrupt)\n`, 'error')
-          appendOutput(`[执行中断 用时 ${elapsed}s]\n\n`, 'meta')
         } else {
           appendOutput(`\n${err}\n`, 'error')
           appendOutput(`[执行异常 用时 ${elapsed}s]\n\n`, 'error')
         }
         currentRunId = null
+        // 任务结束,无论是否还在等待输入都关掉(异常退出可能直接跳过 submitInput)
+        isWaitingInput.value = false
+        userInputText.value = ''
         setReadyUI()
       }
     })
@@ -681,34 +696,20 @@ const handleRun = async () => {
 const handleCancel = () => {
   if (!currentRunId) return
 
-  if (sabSupported.value) {
-    // 软中断:SIGINT,Python 全局状态保留,几乎瞬时
-    appendOutput('\n⛔ 正在中断当前任务...\n', 'error')
-    const runIdToCancel = currentRunId
-    cancel(runIdToCancel)
+  const runIdToCancel = currentRunId
+  currentRunId = null   // 先清空,防止 finish 回调触发时还以为是正常结束
 
-    // 兜底:如果 2 秒后 currentRunId 还没被 finish 清掉,说明走了 timeout fallback
-    // (Python 卡在 await,Pyodide promise 永不 resolve),hardReset 已被触发,
-    // 但 finish 不会被调用 —— 我们主动把 UI 复位,让 watch(isReady) 接管状态切换。
-    setTimeout(() => {
-      if (currentRunId === runIdToCancel) {
-        currentRunId = null
-        waitingForInput.value = false
-        const elapsed = ((performance.now() - runStartTime) / 1000).toFixed(3)
-        appendOutput(`[强制中断 用时 ${elapsed}s]\n\n`, 'meta')
-        // status 由 watch(isReady) 在 hardReset → re-init 过程中接管
-      }
-    }, 2000)
-  } else {
-    // 回退:terminate worker → 重启 (会丢失 Python 全局状态)
-    const runIdToCancel = currentRunId
-    currentRunId = null
-    waitingForInput.value = false
-    appendOutput('\n⛔ 已中断当前任务,正在重启 Python 环境...\n', 'error')
-    cancel(runIdToCancel)
-    status.value = 'initializing'
-    statusText.value = '环境重启中...'
-  }
+  appendOutput('\n⛔ 已中断当前任务,正在重启 Python 环境...\n', 'error')
+
+  // 触发 hardReset: terminate worker → 清状态 → 重新 init
+  cancel(runIdToCancel)
+
+  // UI 立刻进入 initializing,watch(isReady) 会在重启完成后自动切到 ready
+  status.value = 'initializing'
+  statusText.value = '环境重启中...'
+
+  isWaitingInput.value = false
+  userInputText.value = ''
 }
 </script>
 
@@ -803,18 +804,20 @@ const handleCancel = () => {
 }
 @keyframes spin { 100% { transform: rotate(360deg); } }
 
+/* 工作区结构 */
 .workspace {
   display: flex;
   flex-direction: column;
 }
 
+/* 核心设定:编辑器固定高度,CM6 充满容器 */
 .editor-pane {
   height: 300px;
   border-bottom: 1px solid var(--vp-c-divider);
   background-color: var(--vp-c-bg);
 }
 
-/* CodeMirror 6 内部样式 */
+/* 穿透修改 CodeMirror 6 内部样式 */
 :deep(.cm-editor) {
   height: 100%;
   outline: none;
@@ -826,10 +829,6 @@ const handleCancel = () => {
 }
 :deep(.cm-content) {
   padding: 0
-}
-/* 内置函数高亮 (由 pythonBuiltin 注入 cm-builtin class) */
-:deep(.cm-builtin) {
-  color: var(--vp-c-brand-1);
 }
 
 .output-pane {
@@ -857,7 +856,6 @@ const handleCancel = () => {
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
-  cursor: text;
 }
 
 .log-line { color: var(--vp-c-text-1); }
@@ -866,24 +864,6 @@ const handleCancel = () => {
 .log-line.meta { color: var(--vp-c-text-3); font-style: italic; }
 .log-line.success { color: var(--vp-c-success-1); }
 
-/* 内联输入框:与输出文本无缝衔接,模拟终端 */
-.inline-input {
-  font-family: inherit;
-  font-size: inherit;
-  line-height: inherit;
-  color: var(--vp-c-text-1);
-  background: transparent;
-  border: none;
-  outline: none;
-  padding: 0;
-  margin: 0;
-  min-width: 1ch;
-  width: auto;
-  /* 用一个微妙的下划线提示"在等输入",不打断行文 */
-  border-bottom: 1px dashed var(--vp-c-brand-1);
-  caret-color: var(--vp-c-brand-1);
-}
-
 .output-content::-webkit-scrollbar { width: 8px; }
 .output-content::-webkit-scrollbar-track { background: transparent; }
 .output-content::-webkit-scrollbar-thumb {
@@ -891,4 +871,31 @@ const handleCancel = () => {
   border-radius: 4px;
 }
 .output-content::-webkit-scrollbar-thumb:hover { background-color: var(--vp-c-text-3); }
+
+/*
+  内联终端输入:看起来像光标接在最后一行 stdout 后面继续打字。
+  - 无边框、无背景,字体/字号/行高完全继承 .output-content,做到视觉无缝
+  - caret-color 用主题色,有"活的终端"感
+  - 仅在 isWaitingInput 时才渲染,所以不需要额外的隐藏样式
+*/
+.inline-stdin {
+  border: none;
+  outline: none;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  color: var(--vp-c-text-1);
+  caret-color: var(--vp-c-brand-1);
+  /* 避免和上一段 stdout 之间出现意外的空白 */
+  vertical-align: baseline;
+  /* 至少占一点宽度,空状态下也能让用户看到光标 */
+  min-width: 4px;
+}
+.inline-stdin:focus {
+  /* 用一个轻微的下划线提示用户"这里在等输入",不打破终端美学 */
+  box-shadow: inset 0 -1px 0 0 var(--vp-c-brand-1);
+}
 </style>
