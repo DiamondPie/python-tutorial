@@ -5,6 +5,7 @@ export default defineConfig({
   title: "DKD",
   description: "DiamondPie's Knowledge Database",
   appearance: 'dark',
+  ignoreDeadLinks: true,
   themeConfig: {
     // https://vitepress.dev/reference/default-theme-config
     nav: [
